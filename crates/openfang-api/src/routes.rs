@@ -1224,7 +1224,9 @@ pub async fn send_message_stream(
         }
     });
 
-    Sse::new(sse_stream).into_response()
+    Sse::new(sse_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2852,15 +2854,21 @@ pub async fn delete_agent_kv_key(
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Check database connectivity
-    let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]));
-    let db_ok = state
-        .kernel
-        .memory
-        .structured_get(shared_id, "__health_check__")
-        .is_ok();
+    // Run the database check on a blocking thread so we never hold the
+    // std::sync::Mutex<Connection> on a tokio worker thread.  This prevents
+    // the health probe from starving the async runtime when the agent loop
+    // is holding the database lock for session saves.
+    let memory = state.kernel.memory.clone();
+    let db_ok = tokio::task::spawn_blocking(move || {
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        memory
+            .structured_get(shared_id, "__health_check__")
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
 
     let status = if db_ok { "ok" } else { "degraded" };
 
@@ -2874,14 +2882,17 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health = state.kernel.supervisor.health();
 
-    let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]));
-    let db_ok = state
-        .kernel
-        .memory
-        .structured_get(shared_id, "__health_check__")
-        .is_ok();
+    let memory = state.kernel.memory.clone();
+    let db_ok = tokio::task::spawn_blocking(move || {
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        memory
+            .structured_get(shared_id, "__health_check__")
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
 
     let config_warnings = state.kernel.config.validate();
     let status = if db_ok { "ok" } else { "degraded" };
