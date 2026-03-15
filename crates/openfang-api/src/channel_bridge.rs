@@ -50,6 +50,8 @@ use openfang_channels::linkedin::LinkedInAdapter;
 use openfang_channels::mumble::MumbleAdapter;
 use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
+// Dialogue integration
+use openfang_channels::dialogue_proxy::DialogueProxyAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
 use std::sync::Arc;
@@ -1098,7 +1100,8 @@ pub async fn start_channel_bridge_with_config(
         || config.ntfy.is_some()
         || config.gotify.is_some()
         || config.webhook.is_some()
-        || config.linkedin.is_some();
+        || config.linkedin.is_some()
+        || config.dialogue_proxy.is_some();
 
     if !has_any {
         return (None, Vec::new());
@@ -1609,6 +1612,38 @@ pub async fn start_channel_bridge_with_config(
                 li_config.organization_id.clone(),
             ));
             adapters.push((adapter, li_config.default_agent.clone()));
+        }
+    }
+
+    // Dialogue proxy — outbound-only adapters for Dialogue's multi-tenant architecture.
+    // Registers one adapter per channel name (e.g., "telegram", "slack") that proxies
+    // `channel_send` calls through the Dialogue channel-router service.
+    if let Some(ref dp_config) = config.dialogue_proxy {
+        if !dp_config.callback_url.is_empty() && !dp_config.channels.is_empty() {
+            let api_key = std::env::var(&dp_config.api_key_env).unwrap_or_default();
+            let user_id = std::env::var(&dp_config.user_id_env).unwrap_or_default();
+            if !api_key.is_empty() && !user_id.is_empty() {
+                for channel_name in &dp_config.channels {
+                    let adapter: Arc<dyn ChannelAdapter> = Arc::new(DialogueProxyAdapter::new(
+                        channel_name.clone(),
+                        dp_config.callback_url.clone(),
+                        api_key.clone(),
+                        user_id.clone(),
+                    ));
+                    adapters.push((adapter, None));
+                }
+                info!(
+                    channels = ?dp_config.channels,
+                    callback = %dp_config.callback_url,
+                    "Dialogue proxy adapters registered",
+                );
+            } else {
+                warn!(
+                    api_key_env = %dp_config.api_key_env,
+                    user_id_env = %dp_config.user_id_env,
+                    "Dialogue proxy: skipping — missing API key or user ID env vars",
+                );
+            }
         }
     }
 

@@ -26,7 +26,7 @@ use openfang_types::agent::AgentId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -299,7 +299,21 @@ async fn handle_agent_ws(
     // Track last activity for idle timeout
     let mut last_activity = std::time::Instant::now();
 
-    // Main message loop with idle timeout
+    // Track whether a "message" type request is being processed.
+    // This prevents concurrent agent invocations from the same connection
+    // and allows the receive loop to stay responsive for Ping/Pong frames.
+    let processing = Arc::new(AtomicBool::new(false));
+
+    // Track the spawned message task so we can abort it on disconnect.
+    let mut message_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Main message loop with idle timeout.
+    //
+    // IMPORTANT: This loop must NOT block on long-running operations.
+    // Agent message processing is spawned as a background task so the
+    // receiver stays responsive to WebSocket Ping frames. Without this,
+    // upstream proxies (load balancers, reverse proxies) that send pings
+    // would kill the connection mid-response because the pong never arrives.
     loop {
         let msg = tokio::select! {
             msg = receiver.next() => {
@@ -363,7 +377,59 @@ async fn handle_agent_ws(
                 }
                 msg_times.push(now);
 
-                handle_text_message(&sender, &state, agent_id, &text, &verbose).await;
+                // Pre-parse message type to route lightweight messages inline
+                // and spawn heavyweight (agent loop) messages in the background.
+                let msg_type = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_else(|| "message".to_string());
+
+                match msg_type.as_str() {
+                    // Fast path: application-level pings handled inline
+                    "ping" => {
+                        let _ = send_json(
+                            &sender,
+                            &serde_json::json!({"type": "pong"}),
+                        )
+                        .await;
+                    }
+                    // Commands (/stop, /model, /compact, etc.) run inline.
+                    // This is intentional: /stop must work while the agent is
+                    // processing, and other commands are fast enough not to
+                    // block the receive loop for a problematic duration.
+                    "command" => {
+                        handle_text_message(&sender, &state, agent_id, &text, &verbose)
+                            .await;
+                    }
+                    // "message" and unknown types: spawn as a background task
+                    // so the receive loop stays responsive to WS Ping frames.
+                    _ => {
+                        if processing.load(Ordering::Relaxed) {
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "error",
+                                    "content": "Agent is busy processing a message. Please wait.",
+                                }),
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        processing.store(true, Ordering::Relaxed);
+                        let sender_c = Arc::clone(&sender);
+                        let state_c = Arc::clone(&state);
+                        let verbose_c = Arc::clone(&verbose);
+                        let processing_c = Arc::clone(&processing);
+                        message_task = Some(tokio::spawn(async move {
+                            handle_text_message(
+                                &sender_c, &state_c, agent_id, &text, &verbose_c,
+                            )
+                            .await;
+                            processing_c.store(false, Ordering::Relaxed);
+                        }));
+                    }
+                }
             }
             Message::Close(_) => {
                 info!(agent_id = %id_str, "WebSocket closed by client");
@@ -380,6 +446,9 @@ async fn handle_agent_ws(
 
     // Cleanup
     update_handle.abort();
+    if let Some(task) = message_task {
+        task.abort();
+    }
     info!(agent_id = %id_str, "WebSocket disconnected");
 }
 

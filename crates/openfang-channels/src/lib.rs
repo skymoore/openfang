@@ -50,3 +50,5 @@ pub mod linkedin;
 pub mod mumble;
 pub mod ntfy;
 pub mod webhook;
+// Dialogue integration
+pub mod dialogue_proxy;

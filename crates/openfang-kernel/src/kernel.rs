@@ -5816,6 +5816,25 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel send failed: {e}"))?;
         }
 
+        // Check for delivery receipt (provided by adapters that track delivery).
+        if let Some(receipt) = adapter.take_delivery_receipt() {
+            let status_str = match &receipt.status {
+                openfang_channels::types::DeliveryStatus::Delivered => "delivered",
+                openfang_channels::types::DeliveryStatus::Sent => "sent",
+                openfang_channels::types::DeliveryStatus::Failed => "failed",
+                openfang_channels::types::DeliveryStatus::BestEffort => "sent (best-effort)",
+            };
+            let msg_id_part = if receipt.message_id.is_empty() {
+                String::new()
+            } else {
+                format!(", message_id={}", receipt.message_id)
+            };
+            let result = format!(
+                "Message {status_str} to {recipient} via {channel}{msg_id_part}"
+            );
+            return Ok(result);
+        }
+
         Ok(format!("Message sent to {} via {}", recipient, channel))
     }
 
@@ -5877,6 +5896,17 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel media send failed: {e}"))?;
         }
 
+        if let Some(receipt) = adapter.take_delivery_receipt() {
+            let status_str = match &receipt.status {
+                openfang_channels::types::DeliveryStatus::Delivered => "delivered",
+                openfang_channels::types::DeliveryStatus::Sent => "sent",
+                _ => "sent",
+            };
+            return Ok(format!(
+                "{media_type} {status_str} to {recipient} via {channel}"
+            ));
+        }
+
         Ok(format!("{} sent to {} via {}", media_type, recipient, channel))
     }
 
@@ -5927,6 +5957,17 @@ impl KernelHandle for OpenFangKernel {
                 .send(&user, content)
                 .await
                 .map_err(|e| format!("Channel file send failed: {e}"))?;
+        }
+
+        if let Some(receipt) = adapter.take_delivery_receipt() {
+            let status_str = match &receipt.status {
+                openfang_channels::types::DeliveryStatus::Delivered => "delivered",
+                openfang_channels::types::DeliveryStatus::Sent => "sent",
+                _ => "sent",
+            };
+            return Ok(format!(
+                "File '{filename}' {status_str} to {recipient} via {channel}"
+            ));
         }
 
         Ok(format!("File '{}' sent to {} via {}", filename, recipient, channel))
