@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Unique identifier for a user.
@@ -615,6 +616,34 @@ pub struct AgentIdentity {
     pub greeting_style: Option<String>,
 }
 
+/// Cached workspace identity files and context for prompt building.
+///
+/// Populated lazily on the first message to an agent, then refreshed
+/// when `refreshed_at` is older than the configured interval (default 60s).
+/// Avoids re-reading identity files from disk on every single message,
+/// which is critical when the underlying filesystem is slow (e.g. FUSE/S3).
+#[derive(Debug, Clone, Default)]
+pub struct PromptCache {
+    /// SOUL.md content (persona definition).
+    pub soul_md: Option<String>,
+    /// USER.md content (user preferences).
+    pub user_md: Option<String>,
+    /// MEMORY.md content (persistent notes).
+    pub memory_md: Option<String>,
+    /// AGENTS.md content (behavioral guidelines).
+    pub agents_md: Option<String>,
+    /// BOOTSTRAP.md content (first-run ritual).
+    pub bootstrap_md: Option<String>,
+    /// IDENTITY.md content (visual identity + personality).
+    pub identity_md: Option<String>,
+    /// HEARTBEAT.md content (autonomous agent checklist).
+    pub heartbeat_md: Option<String>,
+    /// Pre-built workspace context section (project type, git status, etc.).
+    pub workspace_context: Option<String>,
+    /// When this cache was last populated from disk.
+    pub refreshed_at: DateTime<Utc>,
+}
+
 /// A registered agent entry in the kernel's registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEntry {
@@ -650,6 +679,10 @@ pub struct AgentEntry {
     /// When onboarding was completed.
     #[serde(default)]
     pub onboarding_completed_at: Option<DateTime<Utc>>,
+    /// Cached identity files and workspace context for prompt building.
+    /// Not serialized — populated lazily at runtime, refreshed periodically.
+    #[serde(skip)]
+    pub prompt_cache: Option<Arc<PromptCache>>,
 }
 
 #[cfg(test)]

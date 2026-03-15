@@ -12,7 +12,7 @@
 use crate::registry::AgentRegistry;
 use chrono::Utc;
 use dashmap::DashMap;
-use openfang_types::agent::{AgentId, AgentState};
+use openfang_types::agent::{AgentId, AgentState, ScheduleMode};
 use tracing::{debug, warn};
 
 /// Default heartbeat check interval (seconds).
@@ -139,6 +139,18 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
         match entry_ref.state {
             AgentState::Running | AgentState::Crashed => {}
             _ => continue,
+        }
+
+        // Skip Reactive agents without autonomous config — they are idle by
+        // design and only wake when a message arrives. Monitoring them just
+        // produces endless false-positive "unresponsive" warnings.
+        let is_reactive = matches!(entry_ref.manifest.schedule, ScheduleMode::Reactive);
+        if is_reactive && entry_ref.manifest.autonomous.is_none() {
+            debug!(
+                agent = %entry_ref.name,
+                "Skipping heartbeat for idle Reactive agent (no autonomous config)"
+            );
+            continue;
         }
 
         let inactive_secs = (now - entry_ref.last_active).num_seconds();

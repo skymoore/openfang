@@ -1350,6 +1350,7 @@ impl OpenFangKernel {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         self.registry
             .register(entry.clone())
@@ -1592,7 +1593,7 @@ impl OpenFangKernel {
     ///
     /// WASM and Python agents don't support true streaming — they execute
     /// synchronously and emit a single `TextDelta` + `ContentComplete` pair.
-    pub fn send_message_streaming(
+    pub async fn send_message_streaming(
         self: &Arc<Self>,
         agent_id: AgentId,
         message: &str,
@@ -1667,17 +1668,25 @@ impl OpenFangKernel {
         }
 
         // LLM agent: true streaming via agent loop
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
+        //
+        // Session load runs in spawn_blocking because the SQLite database
+        // lives on a FUSE filesystem (gocryptfs → JuiceFS → S3) where every
+        // I/O call blocks the calling thread for the full network round-trip.
+        let mut session = {
+            let memory = Arc::clone(&self.memory);
+            let sid = entry.session_id;
+            tokio::task::spawn_blocking(move || memory.get_session(sid))
+                .await
+                .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(format!("spawn_blocking join: {e}"))))?
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| openfang_memory::session::Session {
+                    id: sid,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                })
+        };
 
         // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
         let needs_compact = {
@@ -1746,16 +1755,18 @@ impl OpenFangKernel {
             }
         }
 
-        // Build the structured system prompt via prompt_builder
+        // Build the structured system prompt via prompt_builder.
+        //
+        // Identity file reads and workspace context detection hit the FUSE
+        // filesystem (gocryptfs → JuiceFS → S3). We cache them on the agent's
+        // registry entry and only re-read when the cache is stale (>60s old).
+        // Canonical context and user name are also read via spawn_blocking
+        // to avoid starving the tokio runtime.
         {
+            use openfang_types::agent::PromptCache;
+            const CACHE_TTL_SECS: i64 = 3600; // 1 hour — identity files rarely change
+
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
-            let shared_id = shared_memory_agent_id();
-            let user_name = self
-                .memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from));
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -1769,6 +1780,70 @@ impl OpenFangKernel {
                     )
                 })
                 .collect();
+
+            // Check if the agent has a fresh prompt cache.
+            let cached = entry
+                .prompt_cache
+                .as_ref()
+                .filter(|c| {
+                    (chrono::Utc::now() - c.refreshed_at).num_seconds() < CACHE_TTL_SECS
+                })
+                .cloned();
+
+            // If stale or absent, refresh in a blocking thread and store back.
+            let pcache = if let Some(c) = cached {
+                c
+            } else {
+                let workspace = manifest.workspace.clone();
+                let is_autonomous = manifest.autonomous.is_some();
+                let fresh = tokio::task::spawn_blocking(move || {
+                    let ws = workspace.as_deref();
+                    Arc::new(PromptCache {
+                        soul_md: ws.and_then(|w| read_identity_file(w, "SOUL.md")),
+                        user_md: ws.and_then(|w| read_identity_file(w, "USER.md")),
+                        memory_md: ws.and_then(|w| read_identity_file(w, "MEMORY.md")),
+                        agents_md: ws.and_then(|w| read_identity_file(w, "AGENTS.md")),
+                        bootstrap_md: ws.and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
+                        identity_md: ws.and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                        heartbeat_md: if is_autonomous {
+                            ws.and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
+                        } else {
+                            None
+                        },
+                        workspace_context: ws.map(|w| {
+                            let mut ws_ctx =
+                                openfang_runtime::workspace_context::WorkspaceContext::detect(w);
+                            ws_ctx.build_context_section()
+                        }),
+                        refreshed_at: chrono::Utc::now(),
+                    })
+                })
+                .await
+                .unwrap_or_else(|_| Arc::new(PromptCache::default()));
+                // Store back on the registry for subsequent calls.
+                self.registry.set_prompt_cache(agent_id, Arc::clone(&fresh));
+                fresh
+            };
+
+            // Canonical context + user name: small SQLite reads, still over FUSE.
+            let (canonical_context, user_name) = {
+                let memory = Arc::clone(&self.memory);
+                let shared_id = shared_memory_agent_id();
+                tokio::task::spawn_blocking(move || {
+                    let cc = memory
+                        .canonical_context(agent_id, None)
+                        .ok()
+                        .and_then(|(s, _)| s);
+                    let un = memory
+                        .structured_get(shared_id, "user_name")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.as_str().map(String::from));
+                    (cc, un)
+                })
+                .await
+                .unwrap_or((None, None))
+            };
 
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
@@ -1784,23 +1859,10 @@ impl OpenFangKernel {
                     String::new()
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
-                soul_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "SOUL.md")),
-                user_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "USER.md")),
-                memory_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
-                canonical_context: self
-                    .memory
-                    .canonical_context(agent_id, None)
-                    .ok()
-                    .and_then(|(s, _)| s),
+                soul_md: pcache.soul_md.clone(),
+                user_md: pcache.user_md.clone(),
+                memory_md: pcache.memory_md.clone(),
+                canonical_context,
                 user_name,
                 channel_type: None,
                 is_subagent: manifest
@@ -1809,31 +1871,11 @@ impl OpenFangKernel {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 is_autonomous: manifest.autonomous.is_some(),
-                agents_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "AGENTS.md")),
-                bootstrap_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
-                workspace_context: manifest.workspace.as_ref().map(|w| {
-                    let mut ws_ctx =
-                        openfang_runtime::workspace_context::WorkspaceContext::detect(w);
-                    ws_ctx.build_context_section()
-                }),
-                identity_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "IDENTITY.md")),
-                heartbeat_md: if manifest.autonomous.is_some() {
-                    manifest
-                        .workspace
-                        .as_ref()
-                        .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
-                } else {
-                    None
-                },
+                agents_md: pcache.agents_md.clone(),
+                bootstrap_md: pcache.bootstrap_md.clone(),
+                workspace_context: pcache.workspace_context.clone(),
+                identity_md: pcache.identity_md.clone(),
+                heartbeat_md: pcache.heartbeat_md.clone(),
                 peer_agents,
                 current_date: Some(
                     chrono::Local::now()
@@ -1970,23 +2012,33 @@ impl OpenFangKernel {
 
             match result {
                 Ok(result) => {
-                    // Append new messages to canonical session for cross-channel memory
-                    if session.messages.len() > messages_before {
-                        let new_messages = session.messages[messages_before..].to_vec();
-                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
-                            warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
-                        }
-                    }
-
-                    // Write JSONL session mirror to workspace
-                    if let Some(ref workspace) = manifest.workspace {
-                        if let Err(e) =
-                            memory.write_jsonl_mirror(&session, &workspace.join("sessions"))
-                        {
-                            warn!("Failed to write JSONL session mirror (streaming): {e}");
-                        }
-                        // Append daily memory log (best-effort)
-                        append_daily_memory_log(workspace, &result.response);
+                    // Post-processing I/O: append canonical session, write JSONL
+                    // mirror, and daily memory log. All hit the FUSE filesystem,
+                    // so run in spawn_blocking to avoid starving the tokio runtime.
+                    {
+                        let mem = Arc::clone(&memory);
+                        let sess = session.clone();
+                        let ws = manifest.workspace.clone();
+                        let response_text = result.response.clone();
+                        let aid = agent_id;
+                        let msgs_before = messages_before;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if sess.messages.len() > msgs_before {
+                                let new_messages = sess.messages[msgs_before..].to_vec();
+                                if let Err(e) = mem.append_canonical(aid, &new_messages, None) {
+                                    warn!(agent_id = %aid, "Failed to update canonical session (streaming): {e}");
+                                }
+                            }
+                            if let Some(ref workspace) = ws {
+                                if let Err(e) =
+                                    mem.write_jsonl_mirror(&sess, &workspace.join("sessions"))
+                                {
+                                    warn!("Failed to write JSONL session mirror (streaming): {e}");
+                                }
+                                append_daily_memory_log(workspace, &response_text);
+                            }
+                        })
+                        .await;
                     }
 
                     kernel_clone
@@ -6538,6 +6590,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         registry.register(entry).unwrap();
 
@@ -6575,6 +6628,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         registry.register(e1).unwrap();
 
@@ -6598,6 +6652,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         registry.register(e2).unwrap();
 

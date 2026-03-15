@@ -232,6 +232,7 @@ impl StructuredStore {
                     identity,
                     onboarding_completed: false,
                     onboarding_completed_at: None,
+                    prompt_cache: None,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -397,6 +398,7 @@ impl StructuredStore {
                 identity,
                 onboarding_completed: false,
                 onboarding_completed_at: None,
+                prompt_cache: None,
             });
         }
 
