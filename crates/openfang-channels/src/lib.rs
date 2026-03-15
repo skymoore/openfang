@@ -52,3 +52,5 @@ pub mod mumble;
 pub mod ntfy;
 pub mod webhook;
 pub mod wecom;
+// Dialogue integration
+pub mod dialogue_proxy;

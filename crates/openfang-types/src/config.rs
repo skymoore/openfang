@@ -1647,6 +1647,9 @@ pub struct ChannelsConfig {
     pub linkedin: Option<LinkedInConfig>,
     /// WeCom/WeChat Work configuration (None = disabled).
     pub wecom: Option<WeComConfig>,
+    /// Dialogue proxy configuration — outbound-only adapters that relay messages
+    /// through Dialogue's channel-router service (None = disabled).
+    pub dialogue_proxy: Option<DialogueProxyConfig>,
 }
 
 /// Telegram channel adapter configuration.
@@ -2979,6 +2982,38 @@ impl Default for WebhookConfig {
             callback_url: None,
             default_agent: None,
             overrides: ChannelOverrides::default(),
+        }
+    }
+}
+
+/// Dialogue proxy channel adapter configuration.
+///
+/// Outbound-only adapter that proxies `channel_send` calls through Dialogue's
+/// shared channel-router service. Each configured channel name gets its own
+/// adapter instance so agents can call `channel_send(channel="telegram", ...)`
+/// transparently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DialogueProxyConfig {
+    /// URL of the channel-router outbound endpoint
+    /// (e.g., "http://channel-router.dialogue.svc.cluster.local:8021/send").
+    pub callback_url: String,
+    /// Env var name holding the pod's API key for authentication.
+    pub api_key_env: String,
+    /// Env var name holding the Dialogue user ID (pod owner).
+    pub user_id_env: String,
+    /// Channel names to register proxy adapters for (e.g., ["telegram", "slack"]).
+    /// Each name gets its own adapter instance.
+    pub channels: Vec<String>,
+}
+
+impl Default for DialogueProxyConfig {
+    fn default() -> Self {
+        Self {
+            callback_url: String::new(),
+            api_key_env: "OPENFANG_API_KEY".to_string(),
+            user_id_env: "DIALOGUE_USER_ID".to_string(),
+            channels: vec![],
         }
     }
 }

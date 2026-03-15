@@ -277,6 +277,19 @@ pub trait ChannelAdapter: Send + Sync {
     fn suppress_error_responses(&self) -> bool {
         false
     }
+
+    /// Take the last delivery receipt from this adapter (optional).
+    ///
+    /// Adapters that track delivery confirmation (e.g., `DialogueProxyAdapter`)
+    /// override this to return a `DeliveryReceipt` after each `send()` call.
+    /// The receipt is consumed (returns `None` on subsequent calls until the
+    /// next `send()`).
+    ///
+    /// The kernel uses this to record delivery receipts in the `DeliveryTracker`
+    /// and to enrich the `channel_send` tool result shown to the agent.
+    fn take_delivery_receipt(&self) -> Option<DeliveryReceipt> {
+        None
+    }
 }
 
 /// Split a message into chunks of at most `max_len` characters,
