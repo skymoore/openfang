@@ -377,6 +377,7 @@ mod tests {
                 exec_policy: None,
                 tool_allowlist: vec![],
                 tool_blocklist: vec![],
+                ptc_enabled: None,
             },
             state: AgentState::Created,
             mode: AgentMode::default(),

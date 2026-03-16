@@ -67,6 +67,39 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+/// System prompt supplement appended when Programmatic Tool Calling (PTC) is enabled.
+const PTC_SYSTEM_PROMPT_SUPPLEMENT: &str = "\n\n\
+## Programmatic Tool Calling (execute_code)\n\n\
+You have access to an `execute_code` tool that runs Python code with tool functions.\n\
+Use `execute_code` whenever you need to:\n\
+- Read or edit multiple files (loop instead of N separate calls)\n\
+- Search and filter results, then print only relevant data\n\
+- Perform any workflow with 2+ tool calls where intermediate data can be filtered\n\
+- Batch operations (create tasks, check endpoints, process items)\n\n\
+**How it works:** Tool functions are plain synchronous Python functions (no async/await).\n\
+Call them directly: `result = file_read(path=\"src/main.ts\")`.\n\
+Tool results go to your code, NOT your context window. Only `print()` output enters\n\
+your context. This dramatically reduces context usage.\n\n\
+**Important rules:**\n\
+- All tool functions are **synchronous** — call them directly, no `await`, no `asyncio`.\n\
+- `print()` is the ONLY way to return data to your context. Slice large output: `print(result[:2000])`\n\
+- Always use try/except for error handling.\n\
+- Some params are renamed to avoid Python reserved words: `type` -> `type_`, `class` -> `class_`, `from` -> `from_`\n\
+- All tool functions return `str`. Parse JSON results with `json.loads(result)` if needed.\n\n\
+**Example — reading and filtering files:**\n\
+```python\n\
+import json\n\
+try:\n\
+    files = [\"src/main.ts\", \"src/config.ts\", \"src/utils.ts\"]\n\
+    for f in files:\n\
+        content = file_read(path=f)\n\
+        if \"TODO\" in content:\n\
+            print(f\"Found TODO in {f}\")\n\
+            print(content[:500])\n\
+except Exception as e:\n\
+    print(f\"Error: {e}\")\n\
+```\n";
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -269,6 +302,39 @@ pub async fn run_agent_loop(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+
+    // ── Programmatic Tool Calling (PTC) ─────────────────────────────────
+    // If PTC is enabled, replace the tool list with: direct tools + execute_code.
+    // PTC tools get compact Python function signatures instead of full JSON schemas.
+    let ptc_global_enabled = manifest.ptc_enabled.unwrap_or(true);
+    let ptc_config = crate::ptc::PtcConfig::default();
+
+    let mut ptc_instance: Option<crate::ptc::PtcInstance> =
+        if ptc_global_enabled && !available_tools.is_empty() {
+            match crate::ptc::init_ptc(available_tools).await {
+                Ok(instance) => Some(instance),
+                Err(e) => {
+                    warn!("PTC initialization failed, falling back to direct tools: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // If PTC is active, swap the tool list: direct tools + execute_code
+    let ptc_tools_vec: Vec<ToolDefinition>;
+    let available_tools = if let Some(ref ptc) = ptc_instance {
+        ptc_tools_vec = ptc.agent_tools();
+        &ptc_tools_vec[..]
+    } else {
+        available_tools
+    };
+
+    // Append PTC system prompt supplement if PTC is active
+    if ptc_instance.is_some() {
+        system_prompt.push_str(PTC_SYSTEM_PROMPT_SUPPLEMENT);
+    }
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
@@ -571,9 +637,18 @@ pub async fn run_agent_loop(
                     content: MessageContent::Blocks(assistant_blocks),
                 });
 
-                // Build allowed tool names list for capability enforcement
-                let allowed_tool_names: Vec<String> =
+                // Build allowed tool names list for capability enforcement.
+                // When PTC is active, include all PTC tools too (they're called
+                // from the IPC server, not directly by the LLM).
+                let mut allowed_tool_names: Vec<String> =
                     available_tools.iter().map(|t| t.name.clone()).collect();
+                if let Some(ref ptc) = ptc_instance {
+                    for t in &ptc.ptc_tools {
+                        if !allowed_tool_names.contains(&t.name) {
+                            allowed_tool_names.push(t.name.clone());
+                        }
+                    }
+                }
                 let caller_id_str = session.agent_id.to_string();
 
                 // Execute each tool call with loop guard, timeout, and truncation
@@ -660,7 +735,82 @@ pub async fn run_agent_loop(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
-                    let result = match tokio::time::timeout(
+                    // PTC interception: if this is execute_code and PTC is active,
+                    // run Python and concurrently dispatch tool calls from the IPC channel.
+                    let result = if let (true, Some(ptc)) = (
+                        tool_call.name == "execute_code",
+                        ptc_instance.as_mut(),
+                    ) {
+                        let code = tool_call.input["code"].as_str().unwrap_or("");
+                        let ptc_timeout = tool_call.input["timeout"]
+                            .as_u64()
+                            .unwrap_or(ptc_config.timeout_secs)
+                            .clamp(10, 600);
+
+                        // Generate SDK and run Python
+                        let sdk = crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
+                        let full_script = crate::ptc::wrap_user_code(&sdk, code);
+
+                        // Spawn the Python subprocess as a future
+                        let ws = workspace_root.map(|p| p.to_path_buf());
+                        let mut python_fut = tokio::spawn(async move {
+                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref()).await
+                        });
+
+                        // Concurrently handle IPC tool requests while Python runs.
+                        // JoinHandle is Unpin so we can select! on &mut directly.
+                        let python_result: Option<crate::ptc::executor::PythonResult> = loop {
+                            tokio::select! {
+                                // Python finished
+                                py_result = &mut python_fut => {
+                                    break py_result.ok();
+                                }
+                                // IPC tool request from Python
+                                Some(req) = ptc.ipc_server.request_rx.recv() => {
+                                    let eff_exec_policy = manifest.exec_policy.as_ref();
+                                    let tool_result = tool_runner::execute_tool(
+                                        &req.tool_call_id,
+                                        &req.tool_name,
+                                        &req.input,
+                                        kernel.as_ref(),
+                                        Some(&allowed_tool_names),
+                                        Some(&caller_id_str),
+                                        skill_registry,
+                                        mcp_connections,
+                                        web_ctx,
+                                        browser_ctx,
+                                        if hand_allowed_env.is_empty() {
+                                            None
+                                        } else {
+                                            Some(&hand_allowed_env)
+                                        },
+                                        workspace_root,
+                                        media_engine,
+                                        eff_exec_policy,
+                                        tts_engine,
+                                        docker_config,
+                                        process_manager,
+                                    )
+                                    .await;
+                                    let _ = req.response_tx.send(tool_result);
+                                }
+                            }
+                        };
+
+                        match python_result {
+                            Some(py) => ptc_python_result_to_tool_result(
+                                py,
+                                &tool_call.id,
+                                ptc_config.max_stdout_bytes,
+                            ),
+                            None => openfang_types::tool::ToolResult {
+                                tool_use_id: tool_call.id.clone(),
+                                content: "execute_code: Python subprocess failed".to_string(),
+                                is_error: true,
+                            },
+                        }
+                    } else {
+                    match tokio::time::timeout(
                         Duration::from_secs(TOOL_TIMEOUT_SECS),
                         tool_runner::execute_tool(
                             &tool_call.id,
@@ -700,6 +850,7 @@ pub async fn run_agent_loop(
                                 is_error: true,
                             }
                         }
+                    } // end else (non-execute_code tool dispatch)
                     };
 
                     // Fire AfterToolCall hook
@@ -1239,6 +1390,36 @@ pub async fn run_agent_loop_streaming(
     let mut total_usage = TokenUsage::default();
     let final_response;
 
+    // ── Programmatic Tool Calling (PTC) — streaming ─────────────────────
+    let ptc_global_enabled = manifest.ptc_enabled.unwrap_or(true);
+    let ptc_config = crate::ptc::PtcConfig::default();
+
+    let mut ptc_instance: Option<crate::ptc::PtcInstance> =
+        if ptc_global_enabled && !available_tools.is_empty() {
+            match crate::ptc::init_ptc(available_tools).await {
+                Ok(instance) => Some(instance),
+                Err(e) => {
+                    warn!("PTC initialization failed (streaming), falling back to direct tools: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let ptc_tools_vec: Vec<ToolDefinition>;
+    let available_tools = if let Some(ref ptc) = ptc_instance {
+        ptc_tools_vec = ptc.agent_tools();
+        &ptc_tools_vec[..]
+    } else {
+        available_tools
+    };
+
+    // Append PTC system prompt supplement if PTC is active (streaming)
+    if ptc_instance.is_some() {
+        system_prompt.push_str(PTC_SYSTEM_PROMPT_SUPPLEMENT);
+    }
+
     // Safety valve: trim excessively long message histories to prevent context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
         let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
@@ -1555,8 +1736,16 @@ pub async fn run_agent_loop_streaming(
                     content: MessageContent::Blocks(assistant_blocks),
                 });
 
-                let allowed_tool_names: Vec<String> =
+                // Include PTC tools in allowed names (they're callable from IPC, not the LLM)
+                let mut allowed_tool_names: Vec<String> =
                     available_tools.iter().map(|t| t.name.clone()).collect();
+                if let Some(ref ptc) = ptc_instance {
+                    for t in &ptc.ptc_tools {
+                        if !allowed_tool_names.contains(&t.name) {
+                            allowed_tool_names.push(t.name.clone());
+                        }
+                    }
+                }
                 let caller_id_str = session.agent_id.to_string();
 
                 // Execute each tool call with loop guard, timeout, and truncation
@@ -1642,7 +1831,71 @@ pub async fn run_agent_loop_streaming(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
-                    let result = match tokio::time::timeout(
+                    // PTC interception (streaming): same as non-streaming path.
+                    let result = if let (true, Some(ptc)) = (
+                        tool_call.name == "execute_code",
+                        ptc_instance.as_mut(),
+                    ) {
+                        let code = tool_call.input["code"].as_str().unwrap_or("");
+                        let ptc_timeout = tool_call.input["timeout"]
+                            .as_u64()
+                            .unwrap_or(ptc_config.timeout_secs)
+                            .clamp(10, 600);
+
+                        let sdk = crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
+                        let full_script = crate::ptc::wrap_user_code(&sdk, code);
+
+                        let ws = workspace_root.map(|p| p.to_path_buf());
+                        let mut python_fut = tokio::spawn(async move {
+                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref()).await
+                        });
+
+                        let python_result: Option<crate::ptc::executor::PythonResult> = loop {
+                            tokio::select! {
+                                py_result = &mut python_fut => {
+                                    break py_result.ok();
+                                }
+                                Some(req) = ptc.ipc_server.request_rx.recv() => {
+                                    let eff_exec_policy = manifest.exec_policy.as_ref();
+                                    let tool_result = tool_runner::execute_tool(
+                                        &req.tool_call_id,
+                                        &req.tool_name,
+                                        &req.input,
+                                        kernel.as_ref(),
+                                        Some(&allowed_tool_names),
+                                        Some(&caller_id_str),
+                                        skill_registry,
+                                        mcp_connections,
+                                        web_ctx,
+                                        browser_ctx,
+                                        if hand_allowed_env.is_empty() { None } else { Some(&hand_allowed_env) },
+                                        workspace_root,
+                                        media_engine,
+                                        eff_exec_policy,
+                                        tts_engine,
+                                        docker_config,
+                                        process_manager,
+                                    )
+                                    .await;
+                                    let _ = req.response_tx.send(tool_result);
+                                }
+                            }
+                        };
+
+                        match python_result {
+                            Some(py) => ptc_python_result_to_tool_result(
+                                py,
+                                &tool_call.id,
+                                ptc_config.max_stdout_bytes,
+                            ),
+                            None => openfang_types::tool::ToolResult {
+                                tool_use_id: tool_call.id.clone(),
+                                content: "execute_code: Python subprocess failed".to_string(),
+                                is_error: true,
+                            },
+                        }
+                    } else {
+                    match tokio::time::timeout(
                         Duration::from_secs(TOOL_TIMEOUT_SECS),
                         tool_runner::execute_tool(
                             &tool_call.id,
@@ -1682,6 +1935,7 @@ pub async fn run_agent_loop_streaming(
                                 is_error: true,
                             }
                         }
+                    } // end else (non-execute_code tool dispatch, streaming)
                     };
 
                     // Fire AfterToolCall hook
@@ -1875,6 +2129,43 @@ pub async fn run_agent_loop_streaming(
 /// 12. `tool_name\n{"key":"value"}` — bare name + JSON on next line (Llama 4 Scout)
 /// 13. `<tool_use>{"name":"tool","arguments":{...}}</tool_use>` — Llama 3.1+ variant
 ///
+/// Build a ToolResult from a PythonResult, applying output truncation.
+fn ptc_python_result_to_tool_result(
+    py: crate::ptc::executor::PythonResult,
+    tool_use_id: &str,
+    max_stdout_bytes: usize,
+) -> openfang_types::tool::ToolResult {
+    let mut parts: Vec<String> = Vec::new();
+    if !py.stdout.trim().is_empty() {
+        let stdout = if py.stdout.len() > max_stdout_bytes {
+            format!(
+                "{}\n\n[output truncated at {} bytes]",
+                &py.stdout[..max_stdout_bytes],
+                max_stdout_bytes
+            )
+        } else {
+            py.stdout.trim().to_string()
+        };
+        parts.push(stdout);
+    }
+    if py.exit_code != 0 {
+        if !py.stderr.trim().is_empty() {
+            parts.push(format!("\n[stderr]\n{}", py.stderr.trim()));
+        }
+        parts.push(format!("\n[exit code: {}]", py.exit_code));
+    }
+    let output = if parts.is_empty() {
+        "(no output)".to_string()
+    } else {
+        parts.join("\n")
+    };
+    openfang_types::tool::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content: output,
+        is_error: py.exit_code != 0,
+    }
+}
+
 /// Validates tool names against available tools and returns synthetic `ToolCall` entries.
 fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
     let mut calls = Vec::new();

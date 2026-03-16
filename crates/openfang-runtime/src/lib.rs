@@ -36,6 +36,7 @@ pub mod media_understanding;
 pub mod model_catalog;
 pub mod process_manager;
 pub mod prompt_builder;
+pub mod ptc;
 pub mod provider_health;
 pub mod python_runtime;
 pub mod reply_directives;

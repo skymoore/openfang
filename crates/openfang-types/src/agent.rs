@@ -496,6 +496,10 @@ pub struct AgentManifest {
     /// Tool blocklist — these tools are excluded (applied after allowlist).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_blocklist: Vec<String>,
+    /// Per-agent Programmatic Tool Calling override. If `None`, uses global ptc.enabled.
+    /// Set to `false` to disable PTC for this agent (use traditional tool schemas).
+    #[serde(default)]
+    pub ptc_enabled: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -530,6 +534,7 @@ impl Default for AgentManifest {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            ptc_enabled: None,
         }
     }
 }
@@ -820,6 +825,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            ptc_enabled: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();
