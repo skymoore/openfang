@@ -449,22 +449,34 @@ impl MemorySubstrate {
     }
 
     /// Claim the next pending task (optionally for a specific assignee). Returns task JSON or None.
-    pub async fn task_claim(&self, agent_id: &str) -> OpenFangResult<Option<serde_json::Value>> {
+    ///
+    /// Matches tasks where `assigned_to` equals the agent's UUID (`agent_id`),
+    /// the agent's human-readable name (`agent_name`), or is empty (unassigned).
+    /// This allows tasks posted by name (e.g. "get-it-done-hand") to be claimed
+    /// by the agent whose runtime identity is a UUID.
+    pub async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> OpenFangResult<Option<serde_json::Value>> {
         let conn = Arc::clone(&self.conn);
         let agent_id = agent_id.to_string();
+        let agent_name = agent_name.unwrap_or("").to_string();
 
         tokio::task::spawn_blocking(move || {
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
-            // Find first pending task assigned to this agent, or any unassigned pending task
+            // Find first pending task assigned to this agent (by UUID or name),
+            // or any unassigned pending task.
             let mut stmt = db.prepare(
                 "SELECT id, title, description, assigned_to, created_by, created_at
                  FROM task_queue
-                 WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
+                 WHERE status = 'pending'
+                   AND (assigned_to = ?1 OR (?2 != '' AND assigned_to = ?2) OR assigned_to = '')
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1"
             ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let result = stmt.query_row(rusqlite::params![agent_id], |row| {
+            let result = stmt.query_row(rusqlite::params![agent_id, agent_name], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -749,7 +761,7 @@ mod tests {
             .unwrap();
 
         // Claim the task
-        let claimed = substrate.task_claim("auditor").await.unwrap();
+        let claimed = substrate.task_claim("auditor", None).await.unwrap();
         assert!(claimed.is_some());
         let claimed = claimed.unwrap();
         assert_eq!(claimed["id"], task_id);
@@ -770,7 +782,42 @@ mod tests {
     #[tokio::test]
     async fn test_task_claim_empty() {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
-        let claimed = substrate.task_claim("nobody").await.unwrap();
+        let claimed = substrate.task_claim("nobody", None).await.unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_task_claim_by_agent_name() {
+        // Reproduces the hand scenario: task posted with agent name, claimed with UUID
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let task_id = substrate
+            .task_post(
+                "Draft follow-up email",
+                "Draft a follow-up email to Sarah about the partnership",
+                Some("get-it-done-hand"), // EA posts using agent name
+                Some("executive-assistant-hand"),
+            )
+            .await
+            .unwrap();
+
+        // Claiming by UUID alone should NOT match (this was the bug)
+        let claimed = substrate
+            .task_claim("f47ac10b-58cc-4372-a567-0e02b2c3d479", None)
+            .await
+            .unwrap();
+        assert!(claimed.is_none(), "UUID-only claim should not match a name-assigned task");
+
+        // Claiming with the correct agent_name should match
+        let claimed = substrate
+            .task_claim(
+                "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                Some("get-it-done-hand"),
+            )
+            .await
+            .unwrap();
+        assert!(claimed.is_some(), "Claim with agent_name should match name-assigned task");
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed["id"], task_id);
+        assert_eq!(claimed["status"], "in_progress");
     }
 }

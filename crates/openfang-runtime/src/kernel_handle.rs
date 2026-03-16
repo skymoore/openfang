@@ -62,7 +62,12 @@ pub trait KernelHandle: Send + Sync {
     ) -> Result<String, String>;
 
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
-    async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
+    /// `agent_name` allows matching tasks assigned by human-readable name (not just UUID).
+    async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String>;
 
     /// Mark a task as completed with a result string.
     async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String>;

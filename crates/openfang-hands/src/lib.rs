@@ -288,6 +288,9 @@ pub struct HandAgentConfig {
     pub system_prompt: String,
     #[serde(default)]
     pub max_iterations: Option<u32>,
+    /// Maximum wall-clock seconds for a single background tick (default: 300).
+    #[serde(default)]
+    pub max_tick_duration: Option<u64>,
 }
 
 fn default_module() -> String {

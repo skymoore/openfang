@@ -81,6 +81,9 @@ pub struct AutonomousConfig {
     pub heartbeat_interval_secs: u64,
     /// Channel to send heartbeat status to (e.g., "telegram", "discord").
     pub heartbeat_channel: Option<String>,
+    /// Maximum wall-clock seconds for a single background tick.
+    /// If a tick exceeds this duration it is cancelled. Default: 300 (5 min).
+    pub max_tick_duration_secs: u64,
 }
 
 impl Default for AutonomousConfig {
@@ -91,6 +94,7 @@ impl Default for AutonomousConfig {
             max_restarts: 10,
             heartbeat_interval_secs: 30,
             heartbeat_channel: None,
+            max_tick_duration_secs: 300,
         }
     }
 }
@@ -755,6 +759,7 @@ mod tests {
         assert_eq!(cfg.max_iterations, 50);
         assert_eq!(cfg.max_restarts, 10);
         assert_eq!(cfg.heartbeat_interval_secs, 30);
+        assert_eq!(cfg.max_tick_duration_secs, 300);
         assert!(cfg.quiet_hours.is_none());
     }
 

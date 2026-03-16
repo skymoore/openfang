@@ -1040,12 +1040,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For chat channels (telegram, slack): omit recipient to send to the default/linked user. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
+                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier. For email: the email address (required). For chat channels like telegram/slack: omit to send to the default/linked user." },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
                     "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
@@ -1054,7 +1054,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
                 },
-                "required": ["channel", "recipient"]
+                "required": ["channel"]
             }),
         },
         // --- Hand tools (curated autonomous capability packages) ---
@@ -1742,7 +1742,17 @@ async fn tool_task_claim(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = caller_agent_id.unwrap_or("");
-    match kh.task_claim(agent_id).await? {
+    // Resolve the caller's human-readable agent name so task_claim can match
+    // tasks assigned by name (e.g. "get-it-done-hand") in addition to UUID.
+    let agent_name = if !agent_id.is_empty() {
+        kh.list_agents()
+            .iter()
+            .find(|a| a.id == agent_id)
+            .map(|a| a.name.clone())
+    } else {
+        None
+    };
+    match kh.task_claim(agent_id, agent_name.as_deref()).await? {
         Some(task) => {
             serde_json::to_string_pretty(&task).map_err(|e| format!("Serialize error: {e}"))
         }
@@ -2207,18 +2217,13 @@ async fn tool_channel_send(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    // If recipient is empty, resolve from channel's default_chat_id config.
+    // If recipient is empty, try to resolve from the channel's default config.
+    // For proxy adapters (e.g., Dialogue), an empty recipient is normal — the
+    // proxy resolves the destination from its own user context.
     let recipient = if recipient_input.is_empty() {
-        let default_id = kh.get_channel_default_recipient(&channel).await;
-        match default_id {
-            Some(id) => id,
-            None => {
-                return Err(format!(
-                "Missing 'recipient' parameter. Set default_chat_id in [channels.{channel}] config \
-                 or pass recipient explicitly."
-            ))
-            }
-        }
+        kh.get_channel_default_recipient(&channel)
+            .await
+            .unwrap_or_default()
     } else {
         recipient_input
     };

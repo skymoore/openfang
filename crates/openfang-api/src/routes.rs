@@ -4445,10 +4445,16 @@ pub async fn activate_hand(
                         entry.manifest.schedule,
                         openfang_types::agent::ScheduleMode::Reactive
                     ) {
+                        let tick_duration = entry
+                            .manifest
+                            .autonomous
+                            .as_ref()
+                            .map(|a| a.max_tick_duration_secs);
                         state.kernel.start_background_for_agent(
                             agent_id,
                             &entry.name,
                             &entry.manifest.schedule,
+                            tick_duration,
                         );
                     }
                 }

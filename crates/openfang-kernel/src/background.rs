@@ -17,6 +17,14 @@ use tracing::{debug, info, warn};
 /// Maximum number of concurrent background LLM calls across all agents.
 const MAX_CONCURRENT_BG_LLM: usize = 5;
 
+/// Maximum wall-clock duration for a single background tick.
+///
+/// Prevents runaway agent loops from blocking the background executor
+/// indefinitely (e.g. an agent stuck in a retry loop or fighting the
+/// loop guard). If the tick doesn't complete within this duration, it
+/// is cancelled and the next tick can proceed.
+const MAX_TICK_DURATION: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+
 /// Manages background task loops for autonomous agents.
 pub struct BackgroundExecutor {
     /// Running background task handles, keyed by agent ID.
@@ -50,10 +58,14 @@ impl BackgroundExecutor {
         agent_id: AgentId,
         agent_name: &str,
         schedule: &ScheduleMode,
+        max_tick_duration_secs: Option<u64>,
         send_message: F,
     ) where
         F: Fn(AgentId, String) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
+        let tick_timeout = max_tick_duration_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(MAX_TICK_DURATION);
         match schedule {
             ScheduleMode::Reactive => {} // nothing to do
             ScheduleMode::Continuous {
@@ -68,6 +80,7 @@ impl BackgroundExecutor {
                 info!(
                     agent = %name, id = %agent_id,
                     interval_secs = check_interval_secs,
+                    max_tick_secs = tick_timeout.as_secs(),
                     "Starting continuous background loop"
                 );
 
@@ -106,10 +119,23 @@ impl BackgroundExecutor {
                         );
                         debug!(agent = %name, "Continuous loop: sending self-prompt");
                         let busy_clone = busy.clone();
+                        let name_clone = name.clone();
+                        let tick_dur = tick_timeout;
                         let jh = (send_message)(agent_id, prompt);
-                        // Spawn a watcher that clears the busy flag and drops permit when done
+                        // Spawn a watcher that clears the busy flag and drops permit when done.
+                        // Enforces a wall-clock timeout so a stuck agent loop can't block
+                        // the executor indefinitely.
                         tokio::spawn(async move {
-                            let _ = jh.await;
+                            match tokio::time::timeout(tick_dur, jh).await {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    warn!(
+                                        agent = %name_clone,
+                                        timeout_secs = tick_dur.as_secs(),
+                                        "Background tick timed out — cancelling"
+                                    );
+                                }
+                            }
                             drop(permit);
                             busy_clone.store(false, Ordering::SeqCst);
                         });
@@ -166,9 +192,20 @@ impl BackgroundExecutor {
                         );
                         debug!(agent = %name, "Periodic loop: sending scheduled prompt");
                         let busy_clone = busy.clone();
+                        let name_clone = name.clone();
+                        let tick_dur = tick_timeout;
                         let jh = (send_message)(agent_id, prompt);
                         tokio::spawn(async move {
-                            let _ = jh.await;
+                            match tokio::time::timeout(tick_dur, jh).await {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    warn!(
+                                        agent = %name_clone,
+                                        timeout_secs = tick_dur.as_secs(),
+                                        "Background tick timed out — cancelling"
+                                    );
+                                }
+                            }
                             drop(permit);
                             busy_clone.store(false, Ordering::SeqCst);
                         });
@@ -375,7 +412,7 @@ mod tests {
             check_interval_secs: 1, // 1 second for fast test
         };
 
-        executor.start_agent(agent_id, "test-agent", &schedule, move |_id, _msg| {
+        executor.start_agent(agent_id, "test-agent", &schedule, None, move |_id, _msg| {
             let tc = tick_clone.clone();
             tokio::spawn(async move {
                 tc.fetch_add(1, Ordering::SeqCst);
@@ -412,7 +449,7 @@ mod tests {
         };
 
         // Each tick takes 3 seconds — should cause subsequent ticks to be skipped
-        executor.start_agent(agent_id, "slow-agent", &schedule, move |_id, _msg| {
+        executor.start_agent(agent_id, "slow-agent", &schedule, None, move |_id, _msg| {
             let tc = tick_clone.clone();
             tokio::spawn(async move {
                 tc.fetch_add(1, Ordering::SeqCst);
@@ -437,7 +474,7 @@ mod tests {
 
         // Reactive mode → no background task
         let id = AgentId::new();
-        executor.start_agent(id, "reactive", &ScheduleMode::Reactive, |_id, _msg| {
+        executor.start_agent(id, "reactive", &ScheduleMode::Reactive, None, |_id, _msg| {
             tokio::spawn(async {})
         });
         assert_eq!(executor.active_count(), 0);
@@ -450,6 +487,7 @@ mod tests {
             &ScheduleMode::Proactive {
                 conditions: vec!["event:agent_spawned".to_string()],
             },
+            None,
             |_id, _msg| tokio::spawn(async {}),
         );
         assert_eq!(executor.active_count(), 0);

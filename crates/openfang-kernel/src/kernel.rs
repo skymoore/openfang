@@ -2264,17 +2264,71 @@ impl OpenFangKernel {
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
+        // Session load runs in spawn_blocking because the SQLite database
+        // lives on a FUSE filesystem (gocryptfs → JuiceFS → S3) where every
+        // I/O call blocks the calling thread for the full network round-trip.
+        // Without spawn_blocking, this would block a Tokio worker thread and
+        // starve the API server when background agents are active.
+        let mut session = {
+            let memory = Arc::clone(&self.memory);
+            let sid = entry.session_id;
+            tokio::task::spawn_blocking(move || memory.get_session(sid))
+                .await
+                .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(format!("spawn_blocking join: {e}"))))?
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| openfang_memory::session::Session {
+                    id: sid,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                })
+        };
+
+        // Auto-compact if the session is large before running the loop.
+        // This mirrors the compaction check in send_message_streaming and
+        // prevents background agents from accumulating unbounded sessions
+        // that cause progressively slower LLM calls.
+        {
+            use openfang_runtime::compactor::{
+                estimate_token_count, needs_compaction as check_compact,
+                needs_compaction_by_tokens, CompactionConfig,
+            };
+            let config = CompactionConfig::default();
+            let by_messages = check_compact(&session, &config);
+            let estimated = estimate_token_count(
+                &session.messages,
+                Some(&entry.manifest.model.system_prompt),
+                None,
+            );
+            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            if by_messages || by_tokens {
+                info!(
+                    agent_id = %agent_id,
+                    messages = session.messages.len(),
+                    estimated_tokens = estimated,
+                    "Auto-compacting session before agent loop"
+                );
+                match self.compact_agent_session(agent_id).await {
+                    Ok(msg) => {
+                        info!(agent_id = %agent_id, "{msg}");
+                        // Reload the session after compaction
+                        let memory = Arc::clone(&self.memory);
+                        let sid = session.id;
+                        if let Ok(Some(reloaded)) =
+                            tokio::task::spawn_blocking(move || memory.get_session(sid))
+                                .await
+                                .unwrap_or(Ok(None))
+                        {
+                            session = reloaded;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent_id = %agent_id, "Auto-compaction failed: {e}");
+                    }
+                }
+            }
+        }
 
         // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
         {
@@ -2345,13 +2399,28 @@ impl OpenFangKernel {
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
-            let shared_id = shared_memory_agent_id();
-            let user_name = self
-                .memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from));
+
+            // Run SQLite reads in spawn_blocking to avoid blocking Tokio worker
+            // threads on FUSE I/O (gocryptfs → JuiceFS → S3).
+            let (user_name, canonical_ctx) = {
+                let memory = Arc::clone(&self.memory);
+                let aid = agent_id;
+                tokio::task::spawn_blocking(move || {
+                    let shared_id = shared_memory_agent_id();
+                    let uname = memory
+                        .structured_get(shared_id, "user_name")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.as_str().map(String::from));
+                    let cc = memory
+                        .canonical_context(aid, None)
+                        .ok()
+                        .and_then(|(s, _)| s);
+                    (uname, cc)
+                })
+                .await
+                .unwrap_or((None, None))
+            };
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -2392,11 +2461,7 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "MEMORY.md")),
-                canonical_context: self
-                    .memory
-                    .canonical_context(agent_id, None)
-                    .ok()
-                    .and_then(|(s, _)| s),
+                canonical_context: canonical_ctx,
                 user_name,
                 channel_type: None,
                 is_subagent: manifest
@@ -2566,19 +2631,34 @@ impl OpenFangKernel {
         .await
         .map_err(KernelError::OpenFang)?;
 
-        // Append new messages to canonical session for cross-channel memory
+        // Append new messages to canonical session for cross-channel memory.
+        // Run in spawn_blocking to avoid blocking Tokio worker threads on
+        // FUSE-backed SQLite I/O.
         if session.messages.len() > messages_before {
             let new_messages = session.messages[messages_before..].to_vec();
-            if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
+            let memory = Arc::clone(&self.memory);
+            let aid = agent_id;
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                memory.append_canonical(aid, &new_messages, None)
+            })
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))
+            .and_then(|r| r)
+            {
                 warn!("Failed to update canonical session: {e}");
             }
         }
 
         // Write JSONL session mirror to workspace
         if let Some(ref workspace) = manifest.workspace {
-            if let Err(e) = self
-                .memory
-                .write_jsonl_mirror(&session, &workspace.join("sessions"))
+            let memory = Arc::clone(&self.memory);
+            let session_clone = session.clone();
+            let sessions_dir = workspace.join("sessions");
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                memory.write_jsonl_mirror(&session_clone, &sessions_dir)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
             {
                 warn!("Failed to write JSONL session mirror: {e}");
             }
@@ -3302,9 +3382,15 @@ impl OpenFangKernel {
                 format!("hand:{hand_id}"),
                 format!("hand_instance:{}", instance.instance_id),
             ],
-            autonomous: def.agent.max_iterations.map(|max_iter| AutonomousConfig {
-                max_iterations: max_iter,
-                ..Default::default()
+            autonomous: def.agent.max_iterations.map(|max_iter| {
+                let mut ac = AutonomousConfig {
+                    max_iterations: max_iter,
+                    ..Default::default()
+                };
+                if let Some(dur) = def.agent.max_tick_duration {
+                    ac.max_tick_duration_secs = dur;
+                }
+                ac
             }),
             // Autonomous hands must run in Continuous mode so the background loop picks them up.
             // Reactive (default) only fires on incoming messages, so autonomous hands would be inert.
@@ -3856,17 +3942,19 @@ impl OpenFangKernel {
         }
 
         let agents = self.registry.list();
-        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode)> = Vec::new();
+        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode, Option<u64>)> =
+            Vec::new();
 
         for entry in &agents {
             if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
                 continue;
             }
-            bg_agents.push((
-                entry.id,
-                entry.name.clone(),
-                entry.manifest.schedule.clone(),
-            ));
+            let tick_duration = entry
+                .manifest
+                .autonomous
+                .as_ref()
+                .map(|a| a.max_tick_duration_secs);
+            bg_agents.push((entry.id, entry.name.clone(), entry.manifest.schedule.clone(), tick_duration));
         }
 
         if !bg_agents.is_empty() {
@@ -3875,8 +3963,8 @@ impl OpenFangKernel {
             // Stagger agent startup to prevent rate-limit storm on shared providers.
             // Each agent gets a 500ms delay before the next one starts.
             tokio::spawn(async move {
-                for (i, (id, name, schedule)) in bg_agents.into_iter().enumerate() {
-                    kernel.start_background_for_agent(id, &name, &schedule);
+                for (i, (id, name, schedule, tick_duration)) in bg_agents.into_iter().enumerate() {
+                    kernel.start_background_for_agent(id, &name, &schedule, tick_duration);
                     if i > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
@@ -4503,6 +4591,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         name: &str,
         schedule: &ScheduleMode,
+        max_tick_duration_secs: Option<u64>,
     ) {
         // For proactive agents, auto-register triggers from conditions
         if let ScheduleMode::Proactive { conditions } = schedule {
@@ -4521,7 +4610,7 @@ impl OpenFangKernel {
         // Start continuous/periodic loops
         let kernel = Arc::clone(self);
         self.background
-            .start_agent(agent_id, name, schedule, move |aid, msg| {
+            .start_agent(agent_id, name, schedule, max_tick_duration_secs, move |aid, msg| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
                     match k.send_message(aid, &msg).await {
@@ -5831,9 +5920,13 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Task post failed: {e}"))
     }
 
-    async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+    async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String> {
         self.memory
-            .task_claim(agent_id)
+            .task_claim(agent_id, agent_name)
             .await
             .map_err(|e| format!("Task claim failed: {e}"))
     }
