@@ -202,6 +202,7 @@ impl IntegrationRegistry {
                     transport,
                     timeout_secs: 30,
                     env,
+                    headers: vec![],
                 })
             })
             .collect()

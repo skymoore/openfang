@@ -1233,6 +1233,10 @@ pub struct McpServerConfigEntry {
     /// Environment variables to pass through (e.g., ["GITHUB_PERSONAL_ACCESS_TOKEN"]).
     #[serde(default)]
     pub env: Vec<String>,
+    /// Extra HTTP headers to send with every SSE/HTTP request.
+    /// Each entry is `"Header-Name: value"`.  Ignored for stdio transport.
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 fn default_mcp_timeout() -> u64 {

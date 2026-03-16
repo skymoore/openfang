@@ -1884,6 +1884,7 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                ptc_enabled: manifest.ptc_enabled.unwrap_or(self.config.ptc.enabled),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2503,6 +2504,7 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                ptc_enabled: manifest.ptc_enabled.unwrap_or(self.config.ptc.enabled),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -3414,6 +3416,13 @@ impl OpenFangKernel {
             } else {
                 None
             },
+            // Do NOT set tool_allowlist here — capabilities.tools (line 3223) already
+            // provides the primary tool filter in available_tools() Step 1.
+            // Setting tool_allowlist to def.tools would cause Step 4 to strip out
+            // MCP tools that were correctly added in Step 3 via mcp_servers opt-in,
+            // because MCP tool names (mcp_github_*, etc.) are dynamic and not in
+            // the hand's static tool list.
+            tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
             ptc_enabled: None,
             // Custom profile avoids ToolProfile-based expansion overriding the
@@ -4885,6 +4894,7 @@ impl OpenFangKernel {
                 transport,
                 timeout_secs: server_config.timeout_secs,
                 env: server_config.env.clone(),
+                headers: server_config.headers.clone(),
             };
 
             match McpConnection::connect(mcp_config).await {
@@ -4993,6 +5003,7 @@ impl OpenFangKernel {
                 transport,
                 timeout_secs: server_config.timeout_secs,
                 env: server_config.env.clone(),
+                headers: server_config.headers.clone(),
             };
 
             self.extension_health.register(&server_config.name);
@@ -5111,6 +5122,7 @@ impl OpenFangKernel {
             transport,
             timeout_secs: server_config.timeout_secs,
             env: server_config.env.clone(),
+            headers: server_config.headers.clone(),
         };
 
         match McpConnection::connect(mcp_config).await {
@@ -5284,9 +5296,19 @@ impl OpenFangKernel {
                     .cloned()
                     .collect()
             };
+            // When an agent explicitly lists MCP servers via `mcp_servers`,
+            // include all tools from those servers without requiring each
+            // tool name in the declared tools list.  MCP tool names are
+            // dynamic and change when the upstream server updates, so
+            // `mcp_servers` acts as the opt-in for the entire server's
+            // tool set.  If the agent does NOT list mcp_servers (empty
+            // allowlist → all MCP tools are candidates), fall back to the
+            // declared-tools filter to avoid flooding the context.
+            let mcp_explicitly_opted_in = !mcp_allowlist.is_empty();
             for t in mcp_candidates {
-                // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
+                if !tools_unrestricted && !mcp_explicitly_opted_in
+                    && !declared_tools.iter().any(|d| d == &t.name)
+                {
                     continue;
                 }
                 all_tools.push(t);

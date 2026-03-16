@@ -30,6 +30,12 @@ pub struct McpServerConfig {
     /// Environment variables to pass through to the subprocess (sandboxed).
     #[serde(default)]
     pub env: Vec<String>,
+    /// Extra HTTP headers to send with every SSE request.
+    /// Each entry is `"Header-Name: value"`.  Used to pass identity
+    /// headers (e.g. `X-Dialogue-User-Id`) to credential-injecting
+    /// MCP proxies.
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -348,10 +354,27 @@ impl McpConnection {
                 Ok(response.result)
             }
             McpTransportHandle::Sse { client, url } => {
-                let response = client
+                let mut req = client
                     .post(url.as_str())
                     .json(&request)
-                    .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+                    .timeout(std::time::Duration::from_secs(self.config.timeout_secs));
+
+                // Inject extra headers (e.g., X-Dialogue-User-Id for
+                // credential-injecting MCP proxies).
+                for header_str in &self.config.headers {
+                    if let Some((name, value)) = header_str.split_once(':') {
+                        let name = name.trim();
+                        let value = value.trim();
+                        if let (Ok(hn), Ok(hv)) = (
+                            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(value),
+                        ) {
+                            req = req.header(hn, hv);
+                        }
+                    }
+                }
+
+                let response = req
                     .send()
                     .await
                     .map_err(|e| format!("MCP SSE request failed: {e}"))?;
@@ -365,7 +388,21 @@ impl McpConnection {
                     .await
                     .map_err(|e| format!("Failed to read SSE response: {e}"))?;
 
-                let rpc_response: JsonRpcResponse = serde_json::from_str(&body)
+                // Streamable HTTP servers may return SSE-formatted responses
+                // (content-type: text/event-stream) with the JSON-RPC payload
+                // inside `data:` lines, or plain JSON (application/json).
+                // Extract the JSON-RPC payload from whichever format we get.
+                let json_body = if body.contains("data: ") {
+                    // SSE format: collect all `data:` lines into the JSON body.
+                    body.lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .collect::<Vec<_>>()
+                        .join("")
+                } else {
+                    body
+                };
+
+                let rpc_response: JsonRpcResponse = serde_json::from_str(&json_body)
                     .map_err(|e| format!("Invalid MCP SSE JSON-RPC response: {e}"))?;
 
                 if let Some(err) = rpc_response.error {
@@ -752,6 +789,7 @@ mod tests {
             },
             timeout_secs: 30,
             env: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
+            headers: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -776,6 +814,7 @@ mod tests {
             },
             timeout_secs: 60,
             env: vec![],
+            headers: vec!["X-Dialogue-User-Id: test-user-123".to_string()],
         };
         let json = serde_json::to_string(&sse_config).unwrap();
         let back: McpServerConfig = serde_json::from_str(&json).unwrap();
